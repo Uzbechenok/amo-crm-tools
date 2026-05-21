@@ -51,7 +51,8 @@ class VkClient:
             **(params or {}),
         }
 
-        logger.debug("VK API call: %s with params=%s", method, payload)
+        safe_payload = {k: v if k != 'access_token' else '***' for k, v in payload.items()}
+        logger.debug("VK API call: %s with params=%s", method, safe_payload)
         response = requests.post(f"{self.BASE_URL}/{method}", data=payload, timeout=30)
         response.raise_for_status()
         data = response.json()

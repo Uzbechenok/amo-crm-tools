@@ -23,7 +23,7 @@ import logging.handlers
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -95,22 +95,24 @@ class StateManager:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
 
     @property
-    def processed_lead_ids(self) -> Set[int]:
-        """Множество ID уже обработанных лидов."""
-        return set(self._data.get("processed_lead_ids", []))
+    def processed_lead_ids(self) -> List[int]:
+        """Список ID уже обработанных лидов (с сохранением порядка)."""
+        return self._data.get("processed_lead_ids", [])
 
     @processed_lead_ids.setter
-    def processed_lead_ids(self, ids: Set[int]) -> None:
-        self._data["processed_lead_ids"] = list(ids)
+    def processed_lead_ids(self, ids: List[int]) -> None:
+        self._data["processed_lead_ids"] = ids
 
     def add_processed_ids(self, lead_ids: List[int]) -> None:
         """Добавление новых обработанных ID лидов."""
-        current = self.processed_lead_ids
+        current = list(self.processed_lead_ids)
+        # Добавляем только новые ID, чтобы сохранить порядок
+        existing = set(current)
+        new_ids = [lid for lid in lead_ids if lid not in existing]
+        current.extend(new_ids)
         # Не храним больше 10000 ID, чтобы файл не рос бесконечно
-        current.update(lead_ids)
         if len(current) > 10000:
-            # Оставляем только последние 10000
-            current = set(list(current)[-10000:])
+            current = current[-10000:]
         self.processed_lead_ids = current
         self._data["last_run"] = time.time()
         self.save()
@@ -215,7 +217,9 @@ def process_lead(
     try:
         # Парсим ответы анкеты
         flat_lead = VkClient.flatten_lead(lead)
-        answers = VkClient.parse_answers(lead)
+        # flatten_lead уже вызывает parse_answers, извлекаем поля ответов
+        _vk_fields = {'lead_id', 'form_id', 'user_id', 'date', 'ad_id'}
+        answers = {k: v for k, v in flat_lead.items() if k not in _vk_fields}
 
         logger.info("Обработка лида ID=%s", flat_lead.get("lead_id"))
 

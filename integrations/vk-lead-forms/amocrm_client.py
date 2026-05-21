@@ -145,7 +145,16 @@ class AmoCRMClient:
         }
 
         response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            if response.status_code in (400, 401):
+                logger.error(
+                    "Ошибка авторизации: требуется повторная авторизация. "
+                    "Запустите: python3 main.py --auth-code <code>"
+                )
+            raise
+
         data = response.json()
 
         auth = AmoAuth(
