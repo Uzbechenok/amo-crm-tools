@@ -1,0 +1,60 @@
+# Конфигурация интеграции VK Lead Forms → amoCRM
+# Скопируйте в config.yaml и заполните своими данными
+
+vk:
+  # Токен сообщества VK (групповой токен, VK Group Token)
+  # Получить: https://vk.com/club{N} → Управление → Работа с API → Создать токен
+  # Права: leads, groups, wall, stats
+  group_token: "your_vk_group_token"
+
+  # ID сообщества VK (числовой, без знака минус)
+  group_id: 123456789
+
+  # ID конкретной лид-формы (если не указан — обрабатываются все формы группы)
+  # lead_form_id: 12345
+
+amocrm:
+  # OAuth2 данные приложения amoCRM
+  # Получить: https://www.amocrm.ru/ → Настройки → API → Создать интеграцию
+  client_id: "your_amocrm_client_id"
+  client_secret: "your_amocrm_client_secret"
+  redirect_uri: "https://your-domain.com/oauth/callback"
+
+  # Поддомен amoCRM (без .amocrm.ru)
+  subdomain: "your-subdomain"
+
+mapping:
+  # Маппинг полей VK → amoCRM
+  # vk: строка поиска в ответах анкеты
+  # amocrm: ID поля контакта/сделки в amoCRM
+  fields:
+    - vk: "Имя"
+      amocrm: "name"          # Стандартное поле "Имя"
+    - vk: "Телефон"
+      amocrm: "phone"         # Стандартное поле "Телефон"
+    - vk: "Email"
+      amocrm: "email"         # Стандартное поле "Email"
+    - vk: "Комментарий"
+      amocrm: "custom_12345"  # Кастомное поле (CF ID)
+    - vk: "Город"
+      amocrm: "custom_12346"  # Кастомное поле
+
+pipeline:
+  # ID воронки (по умолчанию 1 — Первая)
+  id: 1
+
+  # ID статуса сделки (по умолчанию 14351486 — Первичный контакт)
+  status_id: 14351486
+
+  # ID ответственного пользователя
+  responsible_user_id: 123456
+
+polling:
+  # Интервал опроса в минутах
+  interval_minutes: 5
+
+logging:
+  # Уровень логирования: DEBUG, INFO, WARNING, ERROR
+  level: INFO
+  # Путь к файлу лога (если не указан — только stdout)
+  # file: /var/log/vk-lead-forms.log

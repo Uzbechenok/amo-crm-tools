@@ -1,0 +1,367 @@
+"""
+amoCRM REST API v4 Client.
+
+Аутентификация (OAuth2), поиск/создание контактов, создание сделок.
+Документация: https://www.amocrm.ru/developers/content/api
+"""
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+# Путь к файлу состояния (токены, last_processed_lead_ids) по умолчанию
+DEFAULT_STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+
+
+@dataclass
+class AmoAuth:
+    """Данные OAuth2 аутентификации."""
+    access_token: str
+    refresh_token: str
+    expires_at: float  # unix timestamp
+
+
+class AmoCRMClient:
+    """Клиент для работы с amoCRM REST API v4."""
+
+    def __init__(
+        self,
+        subdomain: str,
+        client_id: str,
+        client_secret: str,
+        redirect_uri: str,
+        state_file: str = DEFAULT_STATE_FILE,
+    ) -> None:
+        """
+        Инициализация amoCRM клиента.
+
+        Args:
+            subdomain: Поддомен аккаунта (без .amocrm.ru).
+            client_id: ID интеграции.
+            client_secret: Секретный ключ интеграции.
+            redirect_uri: Redirect URI приложения.
+            state_file: Путь к файлу состояния для хранения токенов.
+        """
+        self.base_url = f"https://{subdomain}.amocrm.ru"
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = redirect_uri
+        self.state_file = state_file
+
+        self._auth: Optional[AmoAuth] = None
+        self._load_auth()
+
+    # ─────────────── OAuth2 ───────────────
+
+    def _load_auth(self) -> None:
+        """Загрузка токенов из state.json."""
+        try:
+            with open(self.state_file, "r") as f:
+                data = json.load(f)
+            token_data = data.get("token", {})
+            self._auth = AmoAuth(
+                access_token=token_data.get("access_token", ""),
+                refresh_token=token_data.get("refresh_token", ""),
+                expires_at=token_data.get("expires_at", 0),
+            )
+            logger.info("Токены загружены из %s", self.state_file)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            logger.warning("Файл токенов не найден или повреждён: %s", self.state_file)
+            self._auth = None
+
+    def _save_auth(self, auth: AmoAuth) -> None:
+        """Сохранение токенов в state.json."""
+        try:
+            with open(self.state_file, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+
+        data["token"] = {
+            "access_token": auth.access_token,
+            "refresh_token": auth.refresh_token,
+            "expires_at": auth.expires_at,
+        }
+        with open(self.state_file, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        self._auth = auth
+        logger.info("Токены сохранены в %s", self.state_file)
+
+    def _is_token_expired(self) -> bool:
+        """Проверка, истёк ли токен (с запасом в 60 секунд)."""
+        if self._auth is None:
+            return True
+        return time.time() >= (self._auth.expires_at - 60)
+
+    def authorize_from_code(self, auth_code: str) -> None:
+        """
+        Первичная авторизация по коду авторизации.
+
+        Вызывается один раз для получения access/refresh токенов.
+
+        Args:
+            auth_code: Код авторизации из OAuth2 redirect.
+        """
+        url = f"{self.base_url}/oauth2/access_token"
+        payload = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "grant_type": "authorization_code",
+            "code": auth_code,
+            "redirect_uri": self.redirect_uri,
+        }
+
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        auth = AmoAuth(
+            access_token=data["access_token"],
+            refresh_token=data["refresh_token"],
+            expires_at=time.time() + data["expires_in"],
+        )
+        self._save_auth(auth)
+        logger.info("Успешная OAuth2 авторизация через код")
+
+    def _refresh_token(self) -> None:
+        """Обновление access token через refresh token."""
+        if self._auth is None:
+            raise RuntimeError("Нет токенов для обновления. Выполните authorize_from_code().")
+
+        url = f"{self.base_url}/oauth2/access_token"
+        payload = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": self._auth.refresh_token,
+            "redirect_uri": self.redirect_uri,
+        }
+
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        auth = AmoAuth(
+            access_token=data["access_token"],
+            refresh_token=data["refresh_token"],
+            expires_at=time.time() + data["expires_in"],
+        )
+        self._save_auth(auth)
+        logger.info("Токен успешно обновлён")
+
+    def _ensure_token(self) -> str:
+        """
+        Проверка и обновление токена при необходимости.
+
+        Returns:
+            Актуальный access token.
+        """
+        if self._is_token_expired():
+            logger.info("Токен истёк, выполняю refresh...")
+            self._refresh_token()
+        return self._auth.access_token  # type: ignore[union-attr]
+
+    # ─────────────── HTTP методы ───────────────
+
+    def _headers(self) -> Dict[str, str]:
+        """Формирование заголовков с Bearer токеном."""
+        token = self._ensure_token()
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        GET запрос к amoCRM API.
+
+        Args:
+            path: Путь (например, /api/v4/contacts).
+            params: Query параметры.
+
+        Returns:
+            Ответ API.
+        """
+        url = f"{self.base_url}{path}"
+        response = requests.get(url, headers=self._headers(), params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def _post(self, path: str, data: Any) -> Dict[str, Any]:
+        """
+        POST запрос к amoCRM API.
+
+        Args:
+            path: Путь (например, /api/v4/contacts).
+            data: Тело запроса.
+
+        Returns:
+            Ответ API.
+        """
+        url = f"{self.base_url}{path}"
+        response = requests.post(url, headers=self._headers(), json=data, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    # ─────────────── Контакты ───────────────
+
+    def find_contact(
+        self,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Поиск контакта по телефону или email.
+
+        Args:
+            phone: Номер телефона для поиска.
+            email: Email для поиска.
+
+        Returns:
+            ID контакта, если найден, иначе None.
+        """
+        query = phone or email
+        if not query:
+            return None
+
+        params = {"query": query}
+        result = self._get("/api/v4/contacts", params=params)
+        contacts = result.get("_embedded", {}).get("contacts", [])
+
+        if contacts:
+            contact_id = contacts[0]["id"]
+            logger.info("Контакт найден: ID=%d (query=%s)", contact_id, query)
+            return contact_id
+
+        logger.info("Контакт не найден (query=%s)", query)
+        return None
+
+    def create_contact(
+        self,
+        name: str,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+        custom_fields: Optional[Dict[int, Any]] = None,
+    ) -> int:
+        """
+        Создание нового контакта.
+
+        Args:
+            name: Имя контакта.
+            phone: Номер телефона.
+            email: Email.
+            custom_fields: Словарь {custom_field_id: значение} для кастомных полей.
+
+        Returns:
+            ID созданного контакта.
+        """
+        cf_values = []
+
+        if phone:
+            cf_values.append({
+                "field_code": "PHONE",
+                "values": [{"value": phone}],
+            })
+
+        if email:
+            cf_values.append({
+                "field_code": "EMAIL",
+                "values": [{"value": email}],
+            })
+
+        if custom_fields:
+            for field_id, value in custom_fields.items():
+                cf_values.append({
+                    "field_id": field_id,
+                    "values": [{"value": str(value)}],
+                })
+
+        payload = [{
+            "name": name,
+            "custom_fields_values": cf_values,
+        }]
+
+        result = self._post("/api/v4/contacts", payload)
+        contact_id = result["_embedded"]["contacts"][0]["id"]
+        logger.info("Создан контакт: ID=%d, name=%s", contact_id, name)
+        return contact_id
+
+    # ─────────────── Сделки ───────────────
+
+    def create_lead(
+        self,
+        name: str,
+        contact_id: int,
+        pipeline_id: int = 1,
+        status_id: int = 14351486,
+        responsible_user_id: Optional[int] = None,
+        custom_fields: Optional[Dict[int, Any]] = None,
+    ) -> int:
+        """
+        Создание сделки и привязка контакта.
+
+        Args:
+            name: Название сделки.
+            contact_id: ID привязываемого контакта.
+            pipeline_id: ID воронки.
+            status_id: ID статуса.
+            responsible_user_id: ID ответственного пользователя.
+            custom_fields: Словарь {custom_field_id: значение}.
+
+        Returns:
+            ID созданной сделки.
+        """
+        cf_values = []
+        if custom_fields:
+            for field_id, value in custom_fields.items():
+                cf_values.append({
+                    "field_id": field_id,
+                    "values": [{"value": str(value)}],
+                })
+
+        lead_data: Dict[str, Any] = {
+            "name": name,
+            "pipeline_id": pipeline_id,
+            "status_id": status_id,
+            "_embedded": {
+                "contacts": [{"id": contact_id}],
+            },
+        }
+
+        if responsible_user_id:
+            lead_data["responsible_user_id"] = responsible_user_id
+
+        if cf_values:
+            lead_data["custom_fields_values"] = cf_values
+
+        result = self._post("/api/v4/leads", [lead_data])
+        lead_id = result["_embedded"]["leads"][0]["id"]
+        logger.info("Создана сделка: ID=%d, name=%s", lead_id, name)
+        return lead_id
+
+    # ─────────────── Утилиты ───────────────
+
+    @staticmethod
+    def auth_url(subdomain: str, client_id: str, redirect_uri: str) -> str:
+        """
+        Генерация URL для OAuth2 авторизации.
+
+        Args:
+            subdomain: Поддомен аккаунта.
+            client_id: ID интеграции.
+            redirect_uri: Redirect URI.
+
+        Returns:
+            Полный URL авторизации.
+        """
+        return (
+            f"https://{subdomain}.amocrm.ru/oauth?client_id={client_id}"
+            f"&state=leadforms&mode=post_message&redirect_uri={redirect_uri}"
+        )

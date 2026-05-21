@@ -1,0 +1,4 @@
+# VK Lead Forms → amoCRM Integration
+
+requests>=2.31.0
+PyYAML>=6.0
