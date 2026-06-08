@@ -105,7 +105,7 @@ class StateManager:
 
     def add_processed_ids(self, lead_ids: List[int]) -> None:
         """Добавление новых обработанных ID лидов."""
-        current = list(self.processed_lead_ids)
+        current = [int(i) for i in self.processed_lead_ids]
         # Добавляем только новые ID, чтобы сохранить порядок
         existing = set(current)
         new_ids = [lid for lid in lead_ids if lid not in existing]
@@ -322,7 +322,7 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
     )
 
     mapper = FieldMapper(mapping_cfg)
-    processed_ids = state.processed_lead_ids
+    processed_ids = {int(i) for i in state.processed_lead_ids}
     new_lead_ids: List[int] = []
 
     # Получение форм
@@ -356,8 +356,8 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
         success = process_lead(lead, vk, amocrm, mapper, pipeline_cfg)
         if success:
             lead_id = lead.get("lead_id") or lead.get("id")
-            if lead_id:
-                new_lead_ids.append(lead_id)
+            if lead_id is not None:
+                new_lead_ids.append(int(lead_id))
             success_count += 1
 
     # Сохранение состояния
