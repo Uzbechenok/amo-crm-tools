@@ -343,11 +343,12 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
     logger.info("Всего получено лидов: %d", len(all_leads))
 
     # Фильтрация новых лидов
-    new_leads = [
-        lead for lead in all_leads
-        if (lead.get("lead_id") or lead.get("id")) not in processed_ids
-    ]
-    logger.info("Новых (необработанных) лидов: %d", len(new_leads))
+    new_leads = []
+    for lead in all_leads:
+        lid = int(lead.get("lead_id") or lead.get("id"))
+        if lid not in processed_ids:
+            new_leads.append(lead)
+    logger.info("Новых (необработанных) лидов: %d из %d", len(new_leads), len(all_leads))
 
     # Обработка — каждый успешный лид сразу сохраняем в state
     success_count = 0
