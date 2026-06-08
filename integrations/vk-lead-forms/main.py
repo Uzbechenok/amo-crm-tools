@@ -323,7 +323,6 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
 
     mapper = FieldMapper(mapping_cfg)
     processed_ids = {int(i) for i in state.processed_lead_ids}
-    new_lead_ids: List[int] = []
 
     # Получение форм
     if vk_cfg.get("lead_form_id"):
@@ -350,19 +349,15 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
     ]
     logger.info("Новых (необработанных) лидов: %d", len(new_leads))
 
-    # Обработка
+    # Обработка — каждый успешный лид сразу сохраняем в state
     success_count = 0
     for lead in new_leads:
         success = process_lead(lead, vk, amocrm, mapper, pipeline_cfg)
         if success:
             lead_id = lead.get("lead_id") or lead.get("id")
             if lead_id is not None:
-                new_lead_ids.append(int(lead_id))
+                state.add_processed_ids([int(lead_id)])
             success_count += 1
-
-    # Сохранение состояния
-    if new_lead_ids:
-        state.add_processed_ids(new_lead_ids)
 
     logger.info(
         "Прогон завершён: всего=%d, новых=%d, успешно=%d, ошибок=%d",
