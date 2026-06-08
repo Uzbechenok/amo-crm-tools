@@ -195,27 +195,38 @@ class VkClient:
         self,
         form_id: int,
         limit: int = 50,
-        offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """Получение лидов конкретной формы.
+        """Получение ВСЕХ лидов конкретной формы с пагинацией.
 
         Args:
             form_id: ID лид-формы.
-            limit: Макс. количество лидов (макс. 50).
-            offset: Смещение для пагинации.
+            limit: Макс. количество лидов за один запрос (макс. 50).
 
         Returns:
-            Список лидов (каждый — LeadsListElement).
+            Полный список лидов (каждый — LeadsListElement).
         """
-        params = {
-            "_form_ids__in": str(form_id),
-            "limit": min(limit, 50),
-            "offset": offset,
-        }
-        result = self._get("/v1/lead_ads/leads.json", params=params)
-        items = result.get("items", [])
-        logger.info("Получено лидов для формы %s: %d", form_id, len(items))
-        return items
+        page_size = min(limit, 50)
+        offset = 0
+        all_items: List[Dict[str, Any]] = []
+
+        while True:
+            params = {
+                "_form_ids__in": str(form_id),
+                "limit": page_size,
+                "offset": offset,
+            }
+            result = self._get("/v1/lead_ads/leads.json", params=params)
+            items = result.get("items", [])
+            if not items:
+                break
+            all_items.extend(items)
+            offset += len(items)
+            # Если получили меньше, чем запросили — это последняя страница
+            if len(items) < page_size:
+                break
+
+        logger.info("Получено лидов для формы %s: %d", form_id, len(all_items))
+        return all_items
 
     # ─────────────── Парсинг ───────────────
 

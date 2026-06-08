@@ -355,7 +355,9 @@ class AmoCRMClient:
             "id": contact_id,
             "custom_fields_values": cf_values,
         }]
-        self._patch(f"/api/v4/contacts/{contact_id}", payload)
+        # Используем batch-эндпоинт /api/v4/contacts (массив), т.к. single-entity PATCH
+        # ожидает объект, а не массив
+        self._patch("/api/v4/contacts", payload)
         logger.info("Обновлён контакт ID=%d (добавлено %d кастомных полей)", contact_id, len(cf_values))
 
     # ─────────────── Сделки ───────────────

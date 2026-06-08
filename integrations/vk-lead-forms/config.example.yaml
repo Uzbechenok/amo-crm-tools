@@ -27,7 +27,13 @@ amocrm:
 mapping:
   # Маппинг полей VK → amoCRM
   # vk: строка поиска в ответах анкеты
-  # amocrm: ID поля контакта/сделки в amoCRM
+  # amocrm: одно из:
+  #   - "name"        — стандартное поле "Имя"
+  #   - "phone"       — стандартное поле "Телефон"
+  #   - "email"       — стандартное поле "Email"
+  #   - "custom_XXXX"         — кастомное поле контакта (CF ID)
+  #   - "contact_custom_XXXX" — кастомное поле контакта (CF ID, явный префикс)
+  #   - "lead_custom_XXXX"    — кастомное поле сделки (CF ID)
   fields:
     - vk: "Имя"
       amocrm: "name"          # Стандартное поле "Имя"
@@ -36,9 +42,9 @@ mapping:
     - vk: "Email"
       amocrm: "email"         # Стандартное поле "Email"
     - vk: "Комментарий"
-      amocrm: "custom_12345"  # Кастомное поле (CF ID)
+      amocrm: "contact_custom_12345"  # Кастомное поле контакта
     - vk: "Город"
-      amocrm: "custom_12346"  # Кастомное поле
+      amocrm: "lead_custom_12346"     # Кастомное поле сделки
 
 pipeline:
   # ID воронки (по умолчанию 1 — Первая)
