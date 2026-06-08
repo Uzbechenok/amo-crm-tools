@@ -196,10 +196,12 @@ class AmoCRMClient:
             params: Query параметры.
 
         Returns:
-            Ответ API.
+            Ответ API, или пустой словарь, если тело пустое.
         """
         url = f"{self.base_url}{path}"
         response = requests.get(url, headers=self._headers(), params=params, timeout=30)
+        if response.status_code == 204 or not response.text.strip():
+            return {}
         response.raise_for_status()
         return response.json()
 
@@ -216,6 +218,22 @@ class AmoCRMClient:
         """
         url = f"{self.base_url}{path}"
         response = requests.post(url, headers=self._headers(), json=data, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def _patch(self, path: str, data: Any) -> Dict[str, Any]:
+        """
+        PATCH запрос к amoCRM API.
+
+        Args:
+            path: Путь (например, /api/v4/contacts/123).
+            data: Тело запроса.
+
+        Returns:
+            Ответ API.
+        """
+        url = f"{self.base_url}{path}"
+        response = requests.patch(url, headers=self._headers(), json=data, timeout=30)
         response.raise_for_status()
         return response.json()
 
@@ -240,7 +258,16 @@ class AmoCRMClient:
         if not query:
             return None
 
-        params = {"query": query}
+        # Очищаем телефон от спецсимволов: оставляем только цифры и +
+        sanitized = query.strip()
+        if sanitized.startswith("+"):
+            sanitized = "+" + "".join(c for c in sanitized[1:] if c.isdigit())
+        else:
+            sanitized = "".join(c for c in sanitized if c.isdigit())
+
+        logger.debug("Поиск контакта: оригинал=%s, очищен=%s", query, sanitized)
+
+        params = {"query": sanitized}
         result = self._get("/api/v4/contacts", params=params)
         contacts = result.get("_embedded", {}).get("contacts", [])
 
@@ -301,6 +328,35 @@ class AmoCRMClient:
         contact_id = result["_embedded"]["contacts"][0]["id"]
         logger.info("Создан контакт: ID=%d, name=%s", contact_id, name)
         return contact_id
+
+    def update_contact(
+        self,
+        contact_id: int,
+        custom_fields: Optional[Dict[int, Any]] = None,
+    ) -> None:
+        """
+        Обновление кастомных полей существующего контакта.
+
+        Args:
+            contact_id: ID контакта.
+            custom_fields: Словарь {field_id: значение}.
+        """
+        if not custom_fields:
+            return
+
+        cf_values = []
+        for field_id, value in custom_fields.items():
+            cf_values.append({
+                "field_id": field_id,
+                "values": [{"value": str(value)}],
+            })
+
+        payload = [{
+            "id": contact_id,
+            "custom_fields_values": cf_values,
+        }]
+        self._patch(f"/api/v4/contacts/{contact_id}", payload)
+        logger.info("Обновлён контакт ID=%d (добавлено %d кастомных полей)", contact_id, len(cf_values))
 
     # ─────────────── Сделки ───────────────
 

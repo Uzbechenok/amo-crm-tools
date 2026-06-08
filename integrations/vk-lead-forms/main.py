@@ -139,6 +139,8 @@ class FieldMapper:
     def map_to_contact(self, answers: Dict[str, str]) -> Dict[str, Any]:
         """
         Маппинг ответов VK в структуру контакта amoCRM.
+        Использует префиксы: contact_custom_XXX для полей контакта.
+        Поля с lead_custom_XXX игнорируются (они для сделки).
 
         Returns:
             Словарь с ключами: name, phone, email, custom_fields.
@@ -147,7 +149,7 @@ class FieldMapper:
         name = ""
         phone = None
         email = None
-        custom_fields: Dict[int, Any] = {}
+        contact_custom_fields: Dict[int, Any] = {}
 
         for field_map in self._fields:
             vk_key = field_map.get("vk", "")
@@ -163,10 +165,19 @@ class FieldMapper:
                 phone = value
             elif amocrm_field == "email":
                 email = value
+            elif amocrm_field.startswith("lead_custom_"):
+                # Поле сделки — пропускаем в маппинге контакта
+                continue
+            elif amocrm_field.startswith("contact_custom_"):
+                try:
+                    custom_id = int(amocrm_field.replace("contact_custom_", ""))
+                    contact_custom_fields[custom_id] = value
+                except ValueError:
+                    logger.warning("Некорректный custom field ID: %s", amocrm_field)
             elif amocrm_field.startswith("custom_"):
                 try:
                     custom_id = int(amocrm_field.replace("custom_", ""))
-                    custom_fields[custom_id] = value
+                    contact_custom_fields[custom_id] = value
                 except ValueError:
                     logger.warning("Некорректный custom field ID: %s", amocrm_field)
             else:
@@ -176,7 +187,7 @@ class FieldMapper:
             "name": name,
             "phone": phone,
             "email": email,
-            "custom_fields": custom_fields,
+            "custom_fields": contact_custom_fields,
         }
 
     def map_to_lead_custom_fields(
@@ -184,11 +195,25 @@ class FieldMapper:
     ) -> Dict[int, Any]:
         """
         Маппинг ответов VK в кастомные поля сделки.
-
-        (аналогично map_to_contact, но можно расширить для полей сделки).
+        Использует префикс lead_custom_XXX для полей сделки.
         """
-        # По умолчанию те же поля, что и у контакта
-        return self.map_to_contact(answers)["custom_fields"]
+        lead_custom_fields: Dict[int, Any] = {}
+
+        for field_map in self._fields:
+            amocrm_field = field_map.get("amocrm", "")
+            value = answers.get(field_map.get("vk", ""))
+
+            if not value:
+                continue
+
+            if amocrm_field.startswith("lead_custom_"):
+                try:
+                    custom_id = int(amocrm_field.replace("lead_custom_", ""))
+                    lead_custom_fields[custom_id] = value
+                except ValueError:
+                    logger.warning("Некорректный lead custom field ID: %s", amocrm_field)
+
+        return lead_custom_fields
 
 
 # ─────────────────── Основная логика ───────────────────
@@ -232,16 +257,22 @@ def process_lead(
         # Поиск существующего контакта
         contact_id = amocrm.find_contact(phone=phone, email=email)
 
+        contact_custom_fields = contact_data.get("custom_fields", {})
+        lead_custom_fields = mapper.map_to_lead_custom_fields(answers)
+
         if contact_id is None:
             # Создание нового контакта
             contact_id = amocrm.create_contact(
                 name=lead_name,
                 phone=phone,
                 email=email,
-                custom_fields=contact_data.get("custom_fields"),
+                custom_fields=contact_custom_fields,
             )
         else:
             logger.info("Контакт ID=%d уже существует, сделка будет привязана к нему", contact_id)
+            # Обновляем кастомные поля контакта (например VK_WZ)
+            if contact_custom_fields:
+                amocrm.update_contact(contact_id, contact_custom_fields)
 
         # Создание сделки
         amocrm.create_lead(
@@ -250,6 +281,7 @@ def process_lead(
             pipeline_id=pipeline_cfg.get("id", 1),
             status_id=pipeline_cfg.get("status_id", 14351486),
             responsible_user_id=pipeline_cfg.get("responsible_user_id"),
+            custom_fields=lead_custom_fields,
         )
 
         return True
@@ -273,7 +305,12 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
     pipeline_cfg = config.get("pipeline", {})
 
     # Инициализация клиентов
-    vk = VkClient(token=vk_cfg["group_token"], group_id=vk_cfg["group_id"])
+    vk = VkClient(
+        client_id=vk_cfg["client_id"],
+        client_secret=vk_cfg.get("client_secret", ""),
+        ad_account_id=vk_cfg["ad_account_id"],
+        state_file=state.state_file,
+    )
 
     amocrm = AmoCRMClient(
         subdomain=amocrm_cfg["subdomain"],

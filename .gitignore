@@ -4,3 +4,5 @@ node_modules/
 dist/
 __pycache__/
 *.pyc
+integrations/vk-lead-forms/config.yaml
+integrations/vk-lead-forms/state.json

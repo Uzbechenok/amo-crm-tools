@@ -1,160 +1,299 @@
 """
-VK Lead Forms API Client.
+VK Ads API Client — Lead Forms.
 
-Получение списка лид-форм и лидов из VK Community.
-Документация: https://dev.vk.com/method/leadForms
+Получение списка лид-форм и лидов через VK Ads API (ads.vk.com).
+Документация: https://ads.vk.com/en/doc/api/resource/LeadForms
+Авторизация: https://ads.vk.com/en/doc/api/info/Authorization
 """
 
+import json
 import logging
+import os
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+
 
 class VkClient:
-    """Клиент для работы с VK Lead Forms API."""
+    """Клиент для работы с VK Ads Lead Forms API.
 
-    BASE_URL = "https://api.vk.com/method"
-    API_VERSION = "5.199"
+    Заменяет старый клиент на базе dev.vk.com/method/leadForms.
+    Авторизация через OAuth2 Client Credentials Grant.
+    """
 
-    def __init__(self, token: str, group_id: int) -> None:
+    BASE_URL = "https://ads.vk.com/api"
+    AUTH_URL = "https://ads.vk.com/api/v2/oauth2/token.json"
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        ad_account_id: int,
+        state_file: str = DEFAULT_STATE_FILE,
+    ) -> None:
         """
-        Инициализация VK клиента.
-
         Args:
-            token: VK Group Token (токен сообщества).
-            group_id: ID сообщества VK (числовой).
+            client_id: ID приложения из VK Ads → Настройки → API Access.
+            client_secret: Секретный ключ (заглушка до получения от клиента).
+            ad_account_id: ID рекламного кабинета VK.
+            state_file: Путь к state.json для хранения токенов.
         """
-        self.token = token
-        self.group_id = group_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.ad_account_id = ad_account_id
+        self.state_file = state_file
 
-    def _call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Вызов VK API метода.
+        self._access_token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
+        self._expires_at: float = 0.0
+        self._load_tokens()
 
-        Args:
-            method: Название метода (например, 'leadForms.getLeads').
-            params: Параметры запроса.
+    # ─────────────── OAuth2 ───────────────
 
-        Returns:
-            Ответ API.
+    def _load_tokens(self) -> None:
+        """Загрузка токенов из state.json (секция vk_token)."""
+        try:
+            with open(self.state_file, "r") as f:
+                data = json.load(f)
+            token_data = data.get("vk_token", {})
+            self._access_token = token_data.get("access_token")
+            self._refresh_token = token_data.get("refresh_token")
+            self._expires_at = token_data.get("expires_at", 0.0)
+            if self._access_token:
+                logger.info("VK Ads токены загружены из %s", self.state_file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            logger.info("Файл токенов не найден: %s", self.state_file)
 
-        Raises:
-            requests.RequestException: При ошибке сети/HTTP.
-            ValueError: При ошибке VK API.
-        """
-        payload = {
-            "access_token": self.token,
-            "v": self.API_VERSION,
-            **(params or {}),
+    def _save_tokens(self) -> None:
+        """Сохранение токенов в state.json."""
+        try:
+            with open(self.state_file, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+
+        data["vk_token"] = {
+            "access_token": self._access_token,
+            "refresh_token": self._refresh_token,
+            "expires_at": self._expires_at,
         }
+        with open(self.state_file, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info("VK Ads токены сохранены в %s", self.state_file)
 
-        safe_payload = {k: v if k != 'access_token' else '***' for k, v in payload.items()}
-        logger.debug("VK API call: %s with params=%s", method, safe_payload)
-        response = requests.post(f"{self.BASE_URL}/{method}", data=payload, timeout=30)
+    def _is_token_expired(self) -> bool:
+        """Проверка, истёк ли токен (запас 60 секунд)."""
+        return time.time() >= (self._expires_at - 60)
+
+    def fetch_token(self) -> None:
+        """Первичное получение токена через Client Credentials Grant.
+
+        Вызывается один раз при первом запуске.
+        """
+        if not self.client_secret:
+            raise RuntimeError(
+                "client_secret не заполнен. Попросите клиента скопировать его "
+                "из ads.vk.com → Настройки → API Access."
+            )
+
+        response = requests.post(
+            self.AUTH_URL,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            },
+            timeout=30,
+        )
         response.raise_for_status()
         data = response.json()
 
-        # Проверка ошибок VK API
-        if "error" in data:
-            error_msg = data["error"].get("error_msg", "Unknown VK API error")
-            error_code = data["error"].get("error_code", 0)
-            raise ValueError(f"VK API error [{error_code}]: {error_msg}")
+        self._access_token = data["access_token"]
+        self._refresh_token = data.get("refresh_token", "")
+        self._expires_at = time.time() + int(data.get("expires_in", 86400))
+        self._save_tokens()
+        logger.info("VK Ads токен получен")
 
-        return data.get("response", {})
+    def _refresh_token_request(self) -> None:
+        """Обновление access_token через refresh_token."""
+        if not self._refresh_token:
+            raise RuntimeError(
+                "Нет refresh_token. Выполните fetch_token() для первичной авторизации."
+            )
 
-    def get_lead_forms(self) -> List[Dict[str, Any]]:
-        """
-        Получение списка всех лид-форм сообщества.
+        response = requests.post(
+            self.AUTH_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        self._access_token = data["access_token"]
+        if "refresh_token" in data:
+            self._refresh_token = data["refresh_token"]
+        self._expires_at = time.time() + int(data.get("expires_in", 86400))
+        self._save_tokens()
+        logger.info("VK Ads токен обновлён")
+
+    def _ensure_token(self) -> str:
+        """Проверка токена: если истёк — обновить, если нет — вернуть.
 
         Returns:
-            Список лид-форм группы.
+            Актуальный access_token.
         """
-        result = self._call("leadForms.get", {"group_id": self.group_id})
-        forms = result if isinstance(result, list) else result.get("items", [])
-        logger.info("Получено лид-форм: %d", len(forms))
-        return forms
+        if not self._access_token:
+            self.fetch_token()
+        elif self._is_token_expired():
+            logger.info("VK Ads токен истёк, выполняю refresh...")
+            self._refresh_token_request()
+        return self._access_token  # type: ignore[return-value]
 
-    def get_leads(self, form_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    # ─────────────── HTTP ───────────────
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """GET запрос к VK Ads API.
+
+        Args:
+            path: Путь, например /api/v1/lead_ads/lead_forms.json.
+            params: Query-параметры.
+
+        Returns:
+            Распарсенный JSON ответ.
         """
-        Получение лидов конкретной формы.
+        token = self._ensure_token()
+        url = f"{self.BASE_URL}{path}"
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    # ─────────────── Lead Forms ───────────────
+
+    def get_lead_forms(self) -> List[Dict[str, Any]]:
+        """Получение списка всех лид-форм рекламного кабинета.
+
+        Returns:
+            Список лид-форм (каждая — словарь с полями из LeadFormsListElement).
+        """
+        result = self._get("/v1/lead_ads/lead_forms.json")
+        items = result.get("items", [])
+        logger.info("Получено лид-форм: %d", len(items))
+        return items
+
+    def get_leads(
+        self,
+        form_id: int,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Получение лидов конкретной формы.
 
         Args:
             form_id: ID лид-формы.
-            limit: Максимальное количество лидов (макс. 100 за запрос).
+            limit: Макс. количество лидов (макс. 50).
+            offset: Смещение для пагинации.
 
         Returns:
-            Список лидов.
+            Список лидов (каждый — LeadsListElement).
         """
-        result = self._call("leadForms.getLeads", {
-            "group_id": self.group_id,
-            "form_id": form_id,
-            "limit": limit,
-        })
-        leads = result if isinstance(result, list) else result.get("leads", [])
-        logger.info("Получено лидов для формы %d: %d", form_id, len(leads))
-        return leads
+        params = {
+            "_form_ids__in": str(form_id),
+            "limit": min(limit, 50),
+            "offset": offset,
+        }
+        result = self._get("/v1/lead_ads/leads.json", params=params)
+        items = result.get("items", [])
+        logger.info("Получено лидов для формы %s: %d", form_id, len(items))
+        return items
+
+    # ─────────────── Парсинг ───────────────
 
     @staticmethod
     def parse_answers(lead: Dict[str, Any]) -> Dict[str, str]:
-        """
-        Парсинг answers лида в плоскую структуру {вопрос: ответ}.
+        """Парсинг answers лида в плоскую структуру {вопрос: ответ}.
 
-        Ответы VK приходят в виде списка словарей вида:
-        [
-            {"question_key": "Имя", "answer": "Иван"},
-            {"question_key": "Телефон", "answer": "+7...", "key": "phone"},
-            ...
-        ]
+        VK Ads API возвращает ответы в виде:
+            [{"question_text": "Имя", "answer_options": [...], "answer_text": "..."}, ...]
 
         Args:
-            lead: Данные лида (словарь, содержащий 'answers').
+            lead: Данные лида, содержащие ключ 'answers'.
 
         Returns:
             Словарь {название_вопроса: ответ}.
         """
         answers = lead.get("answers", [])
+        if not answers:
+            return {}
+
         result: Dict[str, str] = {}
-
         for item in answers:
-            # question_key — отображаемое название поля формы
-            question = item.get("question_key", "")
-            answer = item.get("answer", "")
-
-            # Пропускаем пустые ответы
-            if not question or not answer:
+            question = (item.get("question_text") or "").strip()
+            if not question:
                 continue
 
-            # Если у вопроса есть key (email, phone и т.д.), используем question_key как имя
-            result[question] = answer
+            # Приоритет: свободный текст > выбранный вариант > пропуск
+            answer_text = (item.get("answer_text") or "").strip()
+            if answer_text:
+                result[question] = answer_text
+                continue
+
+            options = item.get("answer_options", [])
+            if options:
+                texts = [
+                    opt.get("text", "").strip()
+                    for opt in options
+                    if opt.get("text")
+                ]
+                if texts:
+                    result[question] = ", ".join(texts)
 
         return result
 
     @staticmethod
     def flatten_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Преобразование полного лида VK в плоскую структуру.
+        """Преобразование лида VK Ads в плоскую структуру.
 
-        Извлекает основные поля лида и парсит answers.
+        Извлекает основные поля лида, контактные данные и answers.
 
         Args:
-            lead: Исходные данные лида от VK API.
+            lead: Исходный объект LeadsListElement из VK Ads API.
 
         Returns:
-            Плоский словарь с полями: lead_id, form_id, user_id, date,
-            и все распарсенные ответы.
+            Плоский словарь с базовыми полями и ответами.
         """
-        flat = {
-            "lead_id": lead.get("lead_id") or lead.get("id"),
+        flat: Dict[str, Any] = {
+            "lead_id": lead.get("id"),
             "form_id": lead.get("form_id"),
-            "user_id": lead.get("user_id"),
-            "date": lead.get("date"),
-            "ad_id": lead.get("ad_id"),
         }
 
-        # Парсим ответы
+        # Дата создания — ISO строка, передаём как есть
+        created_at = lead.get("created_at")
+        if created_at:
+            flat["date"] = created_at
+
+        # Контактная информация
+        contact_info = lead.get("contact_info") or {}
+        if contact_info.get("first_name"):
+            flat["contact_name"] = contact_info["first_name"]
+        if contact_info.get("phone"):
+            flat["contact_phone"] = contact_info["phone"]
+        if contact_info.get("email"):
+            flat["contact_email"] = contact_info["email"]
+        if contact_info.get("social_media_profile"):
+            flat["contact_social_media_profile"] = contact_info["social_media_profile"]
+
+        # Ответы анкеты
         answers = VkClient.parse_answers(lead)
         flat.update(answers)
 

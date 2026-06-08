@@ -2,15 +2,16 @@
 # Скопируйте в config.yaml и заполните своими данными
 
 vk:
-  # Токен сообщества VK (групповой токен, VK Group Token)
-  # Получить: https://vk.com/club{N} → Управление → Работа с API → Создать токен
-  # Права: leads, groups, wall, stats
-  group_token: "your_vk_group_token"
+  # OAuth2 данные VK Ads API (ads.vk.com)
+  # Получить: ads.vk.com → Настройки → API Access
+  client_id: "your_vk_client_id"
+  # client_secret показывается один раз на 10 минут — скопировать сразу
+  client_secret: "your_vk_client_secret"
 
-  # ID сообщества VK (числовой, без знака минус)
-  group_id: 123456789
+  # ID рекламного кабинета VK (числовой)
+  ad_account_id: 123456789
 
-  # ID конкретной лид-формы (если не указан — обрабатываются все формы группы)
+  # ID конкретной лид-формы (если не указан — обрабатываются все формы кабинета)
   # lead_form_id: 12345
 
 amocrm:

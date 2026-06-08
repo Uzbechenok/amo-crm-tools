@@ -2,10 +2,11 @@
 
 ## Что нужно от клиента для запуска
 
-### 1. VK (сообщество)
-- **ID сообщества** (group_id) — числовой ID, берется из URL или из настроек
+### 1. VK Ads API (ads.vk.com)
+- **client_id** — ID приложения VK Ads (ads.vk.com → Настройки → API Access)
+- **client_secret** — секретный ключ (показывается один раз на 10 минут, скопировать сразу)
+- **ID рекламного кабинета** (ad_account_id) — числовой ID кабинета
 - **ID лид-форм** (form_ids) — ID тех форм, лиды из которых нужно передавать в amoCRM
-- **VK Group token** — создаётся в: Управление → Работа с API → Ключи доступа → права `leads`
 
 ### 2. amoCRM
 - **Subdomain** — например, `clientdomain` (из URL `clientdomain.amocrm.ru`)
