@@ -368,6 +368,7 @@ class AmoCRMClient:
         status_id: int = 14351486,
         responsible_user_id: Optional[int] = None,
         custom_fields: Optional[Dict[int, Any]] = None,
+        tags: Optional[List[str]] = None,
     ) -> int:
         """
         Создание сделки и привязка контакта.
@@ -379,6 +380,7 @@ class AmoCRMClient:
             status_id: ID статуса.
             responsible_user_id: ID ответственного пользователя.
             custom_fields: Словарь {custom_field_id: значение}.
+            tags: Список тегов для сделки (например ["VK_Lids"]).
 
         Returns:
             ID созданной сделки.
@@ -406,9 +408,12 @@ class AmoCRMClient:
         if cf_values:
             lead_data["custom_fields_values"] = cf_values
 
+        if tags:
+            lead_data["_tags"] = tags
+
         result = self._post("/api/v4/leads", [lead_data])
         lead_id = result["_embedded"]["leads"][0]["id"]
-        logger.info("Создана сделка: ID=%d, name=%s", lead_id, name)
+        logger.info("Создана сделка: ID=%d, name=%s (теги: %s)", lead_id, name, tags)
         return lead_id
 
     # ─────────────── Утилиты ───────────────

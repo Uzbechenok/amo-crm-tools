@@ -274,7 +274,7 @@ def process_lead(
             if contact_custom_fields:
                 amocrm.update_contact(contact_id, contact_custom_fields)
 
-        # Создание сделки
+        # Создание сделки с тегом VK_Lids
         amocrm.create_lead(
             name=lead_name,
             contact_id=contact_id,
@@ -282,6 +282,7 @@ def process_lead(
             status_id=pipeline_cfg.get("status_id", 14351486),
             responsible_user_id=pipeline_cfg.get("responsible_user_id"),
             custom_fields=lead_custom_fields,
+            tags=["VK_Lids"],
         )
 
         return True
