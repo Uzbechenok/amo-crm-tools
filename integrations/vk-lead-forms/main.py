@@ -23,10 +23,12 @@ import logging.handlers
 import os
 import sys
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import yaml
 
+from state_utils import locked_update_state
 from vk_client import VkClient
 from amocrm_client import AmoCRMClient
 
@@ -71,7 +73,11 @@ def load_config(config_path: str) -> Dict[str, Any]:
 
 
 class StateManager:
-    """Управление состоянием (processed lead IDs, токены)."""
+    """Управление состоянием (processed lead IDs, токены).
+
+    Все операции записи используют файловую блокировку (fcntl.flock)
+    для защиты от race condition при параллельных запусках.
+    """
 
     def __init__(self, state_file: str = DEFAULT_STATE_FILE) -> None:
         """
@@ -82,17 +88,21 @@ class StateManager:
         self._data: Dict[str, Any] = self._load()
 
     def _load(self) -> Dict[str, Any]:
-        """Загрузка состояния из файла."""
+        """Загрузка состояния из файла (без блокировки, только чтение)."""
         try:
             with open(self.state_file, "r") as f:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return {"processed_lead_ids": [], "last_run": None}
 
-    def save(self) -> None:
-        """Сохранение состояния."""
-        with open(self.state_file, "w") as f:
-            json.dump(self._data, f, indent=2, ensure_ascii=False)
+    def _save(self) -> None:
+        """Сохранение состояния под файловой блокировкой."""
+        def _update(data: dict) -> None:
+            # Копируем processed_lead_ids и last_run из self._data
+            data["processed_lead_ids"] = self._data.get("processed_lead_ids", [])
+            data["last_run"] = self._data.get("last_run")
+
+        locked_update_state(self.state_file, _update)
 
     @property
     def processed_lead_ids(self) -> List[int]:
@@ -104,23 +114,38 @@ class StateManager:
         self._data["processed_lead_ids"] = ids
 
     def add_processed_ids(self, lead_ids: List[int]) -> None:
-        """Добавление новых обработанных ID лидов."""
-        current = [int(i) for i in self.processed_lead_ids]
-        # Добавляем только новые ID, чтобы сохранить порядок
-        existing = set(current)
-        new_ids = [lid for lid in lead_ids if lid not in existing]
-        current.extend(new_ids)
-        # Не храним больше 10000 ID, чтобы файл не рос бесконечно
-        if len(current) > 10000:
-            current = current[-10000:]
-        self.processed_lead_ids = current
-        self._data["last_run"] = time.time()
-        self.save()
+        """
+        Добавление новых обработанных ID лидов.
+
+        Использует файловую блокировку: читает текущее состояние,
+        добавляет новые ID, записывает обратно.
+        """
+        def _update(data: dict) -> None:
+            current = [int(i) for i in data.get("processed_lead_ids", [])]
+            existing = set(current)
+            new_ids = [lid for lid in lead_ids if lid not in existing]
+            if new_ids:
+                current.extend(new_ids)
+                logger.info("Добавлено новых ID в state: %s (всего: %d)", new_ids, len(current))
+            # Не храним больше 10000 ID
+            if len(current) > 10000:
+                current = current[-10000:]
+            data["processed_lead_ids"] = current
+            data["last_run"] = time.time()
+
+            # Обновляем и self._data для консистентности
+            self._data["processed_lead_ids"] = current
+            self._data["last_run"] = data["last_run"]
+
+        locked_update_state(self.state_file, _update)
 
     def update_auth_token(self, token_data: Dict[str, Any]) -> None:
         """Обновление токенов в state."""
+        def _update(data: dict) -> None:
+            data["token"] = token_data
+
+        locked_update_state(self.state_file, _update)
         self._data["token"] = token_data
-        self.save()
 
 
 # ─────────────────── Маппинг ───────────────────
@@ -225,7 +250,7 @@ def process_lead(
     amocrm: AmoCRMClient,
     mapper: FieldMapper,
     pipeline_cfg: Dict[str, Any],
-) -> bool:
+) -> str:
     """
     Обработка одного лида: маппинг → поиск/создание контакта → создание сделки.
 
@@ -237,7 +262,9 @@ def process_lead(
         pipeline_cfg: Конфигурация воронки (id, status_id, responsible_user_id).
 
     Returns:
-        True если успешно, False если ошибка.
+        "created" — сделка создана.
+        "skipped" — сделка уже существует (дубль, пропущено).
+        "error" — ошибка обработки.
     """
     try:
         # Парсим ответы анкеты
@@ -246,19 +273,32 @@ def process_lead(
         _vk_fields = {'lead_id', 'form_id', 'user_id', 'date', 'ad_id'}
         answers = {k: v for k, v in flat_lead.items() if k not in _vk_fields}
 
-        logger.info("Обработка лида ID=%s", flat_lead.get("lead_id"))
+        lead_id_str = flat_lead.get("lead_id", "?")
+        logger.info("Обработка лида ID=%s", lead_id_str)
 
         # Маппинг полей
         contact_data = mapper.map_to_contact(answers)
-        lead_name = contact_data.get("name") or f"Лид VK #{flat_lead.get('lead_id')}"
+        lead_name = contact_data.get("name") or f"Лид VK #{lead_id_str}"
+
+        # Добавляем дату заполнения формы, если есть
+        lead_date_raw = flat_lead.get("date")
+        if lead_date_raw:
+            try:
+                dt = datetime.fromisoformat(lead_date_raw)
+                lead_name = f"{lead_name} от {dt.day:02d}.{dt.month:02d}.{dt.year}"
+            except (ValueError, TypeError):
+                logger.warning("Не удалось распарсить дату лида: %s", lead_date_raw)
+        logger.info("Имя сделки: %s", lead_name)
+
         phone = contact_data.get("phone")
         email = contact_data.get("email")
 
-        # Поиск существующего контакта
-        contact_id = amocrm.find_contact(phone=phone, email=email)
-
         contact_custom_fields = contact_data.get("custom_fields", {})
         lead_custom_fields = mapper.map_to_lead_custom_fields(answers)
+        pipeline_id = pipeline_cfg.get("id", 10141558)
+
+        # --- Поиск/создание контакта ---
+        contact_id = amocrm.find_contact(phone=phone, email=email)
 
         if contact_id is None:
             # Создание нового контакта
@@ -268,28 +308,40 @@ def process_lead(
                 email=email,
                 custom_fields=contact_custom_fields,
             )
+            logger.info("Создан новый контакт ID=%d для лида %s", contact_id, lead_id_str)
         else:
-            logger.info("Контакт ID=%d уже существует, сделка будет привязана к нему", contact_id)
+            logger.info(
+                "Контакт ID=%d уже существует (лид %s), обновляем поля",
+                contact_id, lead_id_str,
+            )
             # Обновляем кастомные поля контакта (например VK_WZ)
             if contact_custom_fields:
                 amocrm.update_contact(contact_id, contact_custom_fields)
 
-        # Создание сделки с тегом VK_Lids
+        # --- Дедупликация сделок ---
+        if amocrm.has_lead_in_pipeline(contact_id, pipeline_id):
+            logger.info(
+                "Сделка у контакта ID=%d в воронке %d уже существует, пропуск",
+                contact_id, pipeline_id,
+            )
+            return "skipped"
+
+        # --- Создание сделки ---
         amocrm.create_lead(
             name=lead_name,
             contact_id=contact_id,
-            pipeline_id=pipeline_cfg.get("id", 1),
-            status_id=pipeline_cfg.get("status_id", 14351486),
+            pipeline_id=pipeline_id,
+            status_id=pipeline_cfg.get("status_id", 86381606),
             responsible_user_id=pipeline_cfg.get("responsible_user_id"),
             custom_fields=lead_custom_fields,
             tags=["VK_Lids"],
         )
 
-        return True
+        return "created"
 
     except Exception as e:
         logger.error("Ошибка обработки лида %s: %s", lead.get("lead_id"), e, exc_info=True)
-        return False
+        return "error"
 
 
 def run_once(config: Dict[str, Any], state: StateManager) -> None:
@@ -350,22 +402,32 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
             new_leads.append(lead)
     logger.info("Новых (необработанных) лидов: %d из %d", len(new_leads), len(all_leads))
 
-    # Обработка — каждый успешный лид сразу сохраняем в state
-    success_count = 0
+    # Обработка лидов
+    created_count = 0
+    skipped_count = 0
+    error_count = 0
     for lead in new_leads:
-        success = process_lead(lead, vk, amocrm, mapper, pipeline_cfg)
-        if success:
-            lead_id = lead.get("lead_id") or lead.get("id")
-            if lead_id is not None:
-                state.add_processed_ids([int(lead_id)])
-            success_count += 1
+        lead_id_raw = lead.get("lead_id") or lead.get("id")
+        result = process_lead(lead, vk, amocrm, mapper, pipeline_cfg)
+
+        # В любом случае (создано, пропущено, ошибка) помечаем lead как обработанный
+        if lead_id_raw is not None:
+            state.add_processed_ids([int(lead_id_raw)])
+
+        if result == "created":
+            created_count += 1
+        elif result == "skipped":
+            skipped_count += 1
+        else:
+            error_count += 1
 
     logger.info(
-        "Прогон завершён: всего=%d, новых=%d, успешно=%d, ошибок=%d",
+        "Прогон завершён: всего=%d, новых=%d, создано=%d, пропущено(дубли)=%d, ошибок=%d",
         len(all_leads),
         len(new_leads),
-        success_count,
-        len(new_leads) - success_count,
+        created_count,
+        skipped_count,
+        error_count,
     )
 
 

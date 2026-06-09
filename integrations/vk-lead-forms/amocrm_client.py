@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from state_utils import locked_update_state
+
 logger = logging.getLogger(__name__)
 
 # Путь к файлу состояния (токены, last_processed_lead_ids) по умолчанию
@@ -77,20 +79,15 @@ class AmoCRMClient:
             self._auth = None
 
     def _save_auth(self, auth: AmoAuth) -> None:
-        """Сохранение токенов в state.json."""
-        try:
-            with open(self.state_file, "r") as f:
-                data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            data = {}
+        """Сохранение токенов в state.json с файловой блокировкой."""
+        def _update(data: dict) -> None:
+            data["token"] = {
+                "access_token": auth.access_token,
+                "refresh_token": auth.refresh_token,
+                "expires_at": auth.expires_at,
+            }
 
-        data["token"] = {
-            "access_token": auth.access_token,
-            "refresh_token": auth.refresh_token,
-            "expires_at": auth.expires_at,
-        }
-        with open(self.state_file, "w") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        locked_update_state(self.state_file, _update)
         self._auth = auth
         logger.info("Токены сохранены в %s", self.state_file)
 
@@ -239,13 +236,39 @@ class AmoCRMClient:
 
     # ─────────────── Контакты ───────────────
 
+    def _sanitize_phone(self, raw: str) -> str:
+        """Очистка телефона: оставляем только цифры и '+' в начале."""
+        s = raw.strip()
+        if s.startswith("+"):
+            return "+" + "".join(c for c in s[1:] if c.isdigit())
+        return "".join(c for c in s if c.isdigit())
+
+    def _search_contact_by_query(self, query: str) -> Optional[int]:
+        """
+        Поиск одного контакта по query-параметру (телефон/email/имя).
+        Если найдено несколько — возвращаем первый.
+        """
+        if not query:
+            return None
+        params = {"query": query}
+        result = self._get("/api/v4/contacts", params=params)
+        contacts = result.get("_embedded", {}).get("contacts", [])
+        if contacts:
+            return contacts[0]["id"]
+        return None
+
     def find_contact(
         self,
         phone: Optional[str] = None,
         email: Optional[str] = None,
     ) -> Optional[int]:
         """
-        Поиск контакта по телефону или email.
+        Поиск контакта по телефону и/или email.
+
+        Стратегия:
+        1. Ищем по телефону (если передан).
+        2. Если не нашли — ищем по email (если передан).
+        3. Если не нашли ни по одному — возвращаем None.
 
         Args:
             phone: Номер телефона для поиска.
@@ -254,30 +277,71 @@ class AmoCRMClient:
         Returns:
             ID контакта, если найден, иначе None.
         """
-        query = phone or email
-        if not query:
+        if not phone and not email:
             return None
 
-        # Очищаем телефон от спецсимволов: оставляем только цифры и +
-        sanitized = query.strip()
-        if sanitized.startswith("+"):
-            sanitized = "+" + "".join(c for c in sanitized[1:] if c.isdigit())
-        else:
-            sanitized = "".join(c for c in sanitized if c.isdigit())
+        # Шаг 1: поиск по телефону
+        if phone:
+            sanitized = self._sanitize_phone(phone)
+            logger.debug("Поиск контакта по телефону: оригинал=%s, очищен=%s", phone, sanitized)
+            contact_id = self._search_contact_by_query(sanitized)
+            if contact_id is not None:
+                logger.info("Контакт найден по телефону: ID=%d", contact_id)
+                return contact_id
+            logger.info("Контакт по телефону %s не найден", phone)
 
-        logger.debug("Поиск контакта: оригинал=%s, очищен=%s", query, sanitized)
+        # Шаг 2: поиск по email (если телефон не дал результата)
+        if email:
+            logger.debug("Поиск контакта по email: %s", email)
+            contact_id = self._search_contact_by_query(email)
+            if contact_id is not None:
+                logger.info("Контакт найден по email: ID=%d", contact_id)
+                return contact_id
+            logger.info("Контакт по email %s не найден", email)
 
-        params = {"query": sanitized}
-        result = self._get("/api/v4/contacts", params=params)
-        contacts = result.get("_embedded", {}).get("contacts", [])
-
-        if contacts:
-            contact_id = contacts[0]["id"]
-            logger.info("Контакт найден: ID=%d (query=%s)", contact_id, query)
-            return contact_id
-
-        logger.info("Контакт не найден (query=%s)", query)
+        logger.info("Контакт не найден: phone=%s, email=%s", phone, email)
         return None
+
+    def find_leads_by_contact(
+        self,
+        contact_id: int,
+        pipeline_id: Optional[int] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Поиск сделок, привязанных к контакту.
+
+        Args:
+            contact_id: ID контакта.
+            pipeline_id: Опционально — ID воронки для фильтрации.
+            limit: Максимум возвращаемых сделок.
+
+        Returns:
+            Список сделок (словарей).
+        """
+        params: Dict[str, Any] = {
+            "filter[contacts][]": contact_id,
+            "limit": limit,
+        }
+        if pipeline_id is not None:
+            params["filter[pipeline_id]"] = pipeline_id
+
+        result = self._get("/api/v4/leads", params=params)
+        return result.get("_embedded", {}).get("leads", [])
+
+    def has_lead_in_pipeline(self, contact_id: int, pipeline_id: int) -> bool:
+        """
+        Проверка, есть ли у контакта сделка в указанной воронке.
+
+        Args:
+            contact_id: ID контакта.
+            pipeline_id: ID воронки (pipeline).
+
+        Returns:
+            True если хотя бы одна сделка существует.
+        """
+        leads = self.find_leads_by_contact(contact_id, pipeline_id=pipeline_id, limit=1)
+        return len(leads) > 0
 
     def create_contact(
         self,
@@ -411,7 +475,9 @@ class AmoCRMClient:
             lead_data["custom_fields_values"] = cf_values
 
         if tags:
-            lead_data["_tags"] = tags
+            if "_embedded" not in lead_data:
+                lead_data["_embedded"] = {}
+            lead_data["_embedded"]["tags"] = [{"name": t} for t in tags]
 
         result = self._post("/api/v4/leads", [lead_data])
         lead_id = result["_embedded"]["leads"][0]["id"]

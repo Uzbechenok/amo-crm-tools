@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from state_utils import locked_update_state
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
@@ -70,20 +72,15 @@ class VkClient:
             logger.info("Файл токенов не найден: %s", self.state_file)
 
     def _save_tokens(self) -> None:
-        """Сохранение токенов в state.json."""
-        try:
-            with open(self.state_file, "r") as f:
-                data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            data = {}
+        """Сохранение токенов в state.json с файловой блокировкой."""
+        def _update(data: dict) -> None:
+            data["vk_token"] = {
+                "access_token": self._access_token,
+                "refresh_token": self._refresh_token,
+                "expires_at": self._expires_at,
+            }
 
-        data["vk_token"] = {
-            "access_token": self._access_token,
-            "refresh_token": self._refresh_token,
-            "expires_at": self._expires_at,
-        }
-        with open(self.state_file, "w") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        locked_update_state(self.state_file, _update)
         logger.info("VK Ads токены сохранены в %s", self.state_file)
 
     def _is_token_expired(self) -> bool:
