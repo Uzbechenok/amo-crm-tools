@@ -310,6 +310,9 @@ class AmoCRMClient:
     ) -> List[Dict[str, Any]]:
         """
         Поиск сделок, привязанных к контакту.
+        Фильтрация по статусу не передаётся в API — filter[statuses] в amoCRM API v4
+        не работает корректно. При необходимости фильтр по статусу применяется в коде
+        (см. has_lead_in_pipeline).
 
         Args:
             contact_id: ID контакта.
@@ -329,19 +332,91 @@ class AmoCRMClient:
         result = self._get("/api/v4/leads", params=params)
         return result.get("_embedded", {}).get("leads", [])
 
-    def has_lead_in_pipeline(self, contact_id: int, pipeline_id: int) -> bool:
+    def has_lead_in_pipeline(self, contact_id: int, pipeline_id: int, status_id: Optional[int] = None) -> bool:
         """
-        Проверка, есть ли у контакта сделка в указанной воронке.
+        Проверка, есть ли у контакта сделка в указанной воронке (опционально — в указанном статусе).
+        Фильтр по статусу делается в коде, т.к. filter[statuses] в amoCRM API не работает.
 
         Args:
             contact_id: ID контакта.
             pipeline_id: ID воронки (pipeline).
+            status_id: Опционально — ID статуса для фильтрации.
 
         Returns:
-            True если хотя бы одна сделка существует.
+            True если хотя бы одна сделка существует (в нужном статусе).
         """
-        leads = self.find_leads_by_contact(contact_id, pipeline_id=pipeline_id, limit=1)
+        leads = self.find_leads_by_contact(contact_id, pipeline_id=pipeline_id, limit=250)
+        if not leads:
+            return False
+        if status_id is not None:
+            # Фильтруем в коде — проверяем что сделка в нужном статусе
+            return any(lead.get("status_id") == status_id for lead in leads)
         return len(leads) > 0
+
+    def find_lead_by_custom_field(self, field_id: int, value: Any) -> Optional[int]:
+        """
+        Поиск сделки по значению кастомного поля.
+
+        Args:
+            field_id: ID кастомного поля.
+            value: Значение для поиска.
+
+        Returns:
+            ID сделки, если найдена, иначе None.
+        """
+        # Сначала пробуем фильтрацию через API (требует включения в настройках аккаунта)
+        try:
+            params = {
+                f"filter[custom_fields_values][{field_id}][]": value,
+                "limit": 1,
+            }
+            result = self._get("/api/v4/leads", params=params)
+            leads = result.get("_embedded", {}).get("leads", [])
+            if leads:
+                return leads[0]["id"]
+        except requests.HTTPError as exc:
+            logger.warning(
+                "Фильтр по кастомному полю недоступен для аккаунта (HTTP %s). "
+                "Запускаю pagination fallback...",
+                exc.response.status_code if exc.response is not None else "?",
+            )
+
+        # Fallback: итерация по всем сделкам с проверкой в коде.
+        page = 1
+        while True:
+            try:
+                page_params = {
+                    "limit": 250,
+                    "page": page,
+                    "with": "custom_fields_values",
+                }
+                result = self._get("/api/v4/leads", params=page_params)
+                leads = result.get("_embedded", {}).get("leads", [])
+                if not leads:
+                    break
+
+                for lead in leads:
+                    cfs = lead.get("custom_fields_values")
+                    if not cfs:
+                        continue
+                    for cf in cfs:
+                        if cf.get("field_id") == field_id:
+                            for v in cf.get("values", []):
+                                if v.get("value") == value:
+                                    logger.info(
+                                        "Сделка найдена через fallback: ID=%d, field_id=%d, value=%s",
+                                        lead["id"], field_id, value,
+                                    )
+                                    return lead["id"]
+
+                page += 1
+            except Exception as exc:
+                logger.error(
+                    "Ошибка при pagination fallback (field_id=%d): %s", field_id, exc
+                )
+                break
+
+        return None
 
     def create_contact(
         self,

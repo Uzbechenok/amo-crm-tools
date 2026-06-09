@@ -38,6 +38,9 @@ logger = logging.getLogger("vk_lead_forms")
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "config.yaml")
 DEFAULT_STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 
+# ID кастомного поля «ID лида VK» в amoCRM (тип numeric)
+VK_LEAD_FIELD_ID = 2253949
+
 
 # ─────────────────── Конфигурация ───────────────────
 
@@ -250,6 +253,7 @@ def process_lead(
     amocrm: AmoCRMClient,
     mapper: FieldMapper,
     pipeline_cfg: Dict[str, Any],
+    existing_vk_leads: Optional[Dict[int, int]] = None,
 ) -> str:
     """
     Обработка одного лида: маппинг → поиск/создание контакта → создание сделки.
@@ -260,6 +264,8 @@ def process_lead(
         amocrm: Экземпляр AmoCRMClient.
         mapper: Экземпляр FieldMapper.
         pipeline_cfg: Конфигурация воронки (id, status_id, responsible_user_id).
+        existing_vk_leads: Словарь {vk_lead_id: deal_id} для дедупликации
+                           без обращения к API. Если None — проверка не делается.
 
     Returns:
         "created" — сделка создана.
@@ -284,7 +290,19 @@ def process_lead(
         lead_date_raw = flat_lead.get("date")
         if lead_date_raw:
             try:
-                dt = datetime.fromisoformat(lead_date_raw)
+                # Нормализуем дробные секунды до 6 цифр (микросекунды)
+                date_str = lead_date_raw
+                if '.' in date_str:
+                    base, frac = date_str.split('.', 1)
+                    tz_part = ''
+                    for i, ch in enumerate(frac):
+                        if ch in '+-':
+                            tz_part = frac[i:]
+                            frac = frac[:i]
+                            break
+                    frac = frac.ljust(6, '0')[:6]
+                    date_str = f"{base}.{frac}{tz_part}"
+                dt = datetime.fromisoformat(date_str)
                 lead_name = f"{lead_name} от {dt.day:02d}.{dt.month:02d}.{dt.year}"
             except (ValueError, TypeError):
                 logger.warning("Не удалось распарсить дату лида: %s", lead_date_raw)
@@ -296,6 +314,17 @@ def process_lead(
         contact_custom_fields = contact_data.get("custom_fields", {})
         lead_custom_fields = mapper.map_to_lead_custom_fields(answers)
         pipeline_id = pipeline_cfg.get("id", 10141558)
+
+        # --- Дедупликация сделок по VK Lead ID (без API-запроса) ---
+        vk_lead_id = flat_lead.get("lead_id")
+        if vk_lead_id and existing_vk_leads is not None:
+            existing_deal_id = existing_vk_leads.get(int(vk_lead_id))
+            if existing_deal_id is not None:
+                logger.info(
+                    "Сделка с VK Lead ID=%s уже существует (ID=%d), пропуск",
+                    vk_lead_id, existing_deal_id,
+                )
+                return "skipped"
 
         # --- Поиск/создание контакта ---
         contact_id = amocrm.find_contact(phone=phone, email=email)
@@ -318,13 +347,9 @@ def process_lead(
             if contact_custom_fields:
                 amocrm.update_contact(contact_id, contact_custom_fields)
 
-        # --- Дедупликация сделок ---
-        if amocrm.has_lead_in_pipeline(contact_id, pipeline_id):
-            logger.info(
-                "Сделка у контакта ID=%d в воронке %d уже существует, пропуск",
-                contact_id, pipeline_id,
-            )
-            return "skipped"
+        # Передаём VK Lead ID в кастомные поля сделки
+        if vk_lead_id:
+            lead_custom_fields[VK_LEAD_FIELD_ID] = int(vk_lead_id)
 
         # --- Создание сделки ---
         amocrm.create_lead(
@@ -342,6 +367,62 @@ def process_lead(
     except Exception as e:
         logger.error("Ошибка обработки лида %s: %s", lead.get("lead_id"), e, exc_info=True)
         return "error"
+
+
+def _load_all_vk_leads(amocrm: AmoCRMClient) -> Dict[int, int]:
+    """
+    Загрузить все сделки из amoCRM один раз и построить словарь
+    {vk_lead_id: deal_id} по кастомному полю VK_LEAD_FIELD_ID.
+
+    Args:
+        amocrm: Экземпляр AmoCRMClient.
+
+    Returns:
+        Словарь {vk_lead_id (int): deal_id (int)}.
+    """
+    existing_vk_leads: Dict[int, int] = {}
+    page = 1
+    total_loaded = 0
+
+    while True:
+        try:
+            leads_page = amocrm._get("/api/v4/leads", params={
+                "limit": 250,
+                "page": page,
+                "with": "custom_fields",
+            })
+        except Exception as e:
+            logger.warning("Ошибка загрузки сделок (стр. %d): %s — пропускаем предзагрузку", page, e)
+            return {}
+
+        items = leads_page.get("_embedded", {}).get("leads", [])
+        if not items:
+            break
+
+        for lead in items:
+            deal_id = lead.get("id")
+            if not deal_id:
+                continue
+            custom_fields = lead.get("custom_fields_values") or []
+            for cf in custom_fields:
+                if cf.get("field_id") == VK_LEAD_FIELD_ID:
+                    for val in cf.get("values", []):
+                        raw = val.get("value")
+                        if raw:
+                            try:
+                                existing_vk_leads[int(raw)] = deal_id
+                            except (ValueError, TypeError):
+                                logger.debug("Некорректное значение VK Lead ID: %s", raw)
+                    break  # field_id найден, остальные не нужны
+
+        total_loaded += len(items)
+        page += 1
+
+    logger.info(
+        "Загружено сделок: %d, найдено VK Lead ID: %d",
+        total_loaded, len(existing_vk_leads),
+    )
+    return existing_vk_leads
 
 
 def run_once(config: Dict[str, Any], state: StateManager) -> None:
@@ -376,6 +457,9 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
     mapper = FieldMapper(mapping_cfg)
     processed_ids = {int(i) for i in state.processed_lead_ids}
 
+    # Предзагрузка всех существующих сделок с VK Lead ID (один проход)
+    existing_vk_leads = _load_all_vk_leads(amocrm)
+
     # Получение форм
     if vk_cfg.get("lead_form_id"):
         # Конкретная форма
@@ -408,7 +492,10 @@ def run_once(config: Dict[str, Any], state: StateManager) -> None:
     error_count = 0
     for lead in new_leads:
         lead_id_raw = lead.get("lead_id") or lead.get("id")
-        result = process_lead(lead, vk, amocrm, mapper, pipeline_cfg)
+        result = process_lead(
+            lead, vk, amocrm, mapper, pipeline_cfg,
+            existing_vk_leads=existing_vk_leads,
+        )
 
         # В любом случае (создано, пропущено, ошибка) помечаем lead как обработанный
         if lead_id_raw is not None:
